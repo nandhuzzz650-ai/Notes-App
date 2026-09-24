@@ -91,7 +91,7 @@ const TOPICS=["Indian Heritage and Culture","Modern Indian History","Society","W
 "Science & Technology","Environment","Disaster Management","Internal Security",
 "Ethics, Integrity and Aptitude","CSAT","Optional"];
 
-let db, view="daily", curNoteId=null;
+let db, view="daily", curNoteId=null, curSectionId=null;
 const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,8);
 const fmtDate=d=>new Date(d).toLocaleDateString('en-IN',{day:'numeric',month:'long',year:'numeric'});
 const fmtTime=d=>new Date(d).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
@@ -206,12 +206,50 @@ async function addSection(dailyNoteId,topic,title,content,tags){
     createdAt:Date.now(),updatedAt:Date.now(),history:[]};
   await put('sections',s); return s;
 }
-async function appendToSection(sectionId,newContent){
-  const s=await getOne('sections',sectionId);
-  s.history.push({date:s.updatedAt,content:s.content});
-  s.content=s.content+`\n\n— Added ${fmtDate(Date.now())} —\n`+newContent;
-  s.updatedAt=Date.now();
-  await put('sections',s); return s;
+// A section's `content` is the innerHTML of its notepad editor: plain text plus
+// inline <img> tags wherever an image was inserted between notes. Storing it as
+// HTML in the same `content` field (rather than a new column) means it rides
+// along with the existing local + cloud sync with no schema changes.
+function legacyToHtml(content){
+  if(!content) return '';
+  if(/<[a-z][\s\S]*>/i.test(content) && !/\[\[IMG\]\]/.test(content)) return content; // already rich HTML
+  const esc=t=>t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const re=/\[\[IMG\]\]([\s\S]*?)\[\[\/IMG\]\]/g;
+  let html='',last=0,m;
+  while((m=re.exec(content))){
+    html+=esc(content.slice(last,m.index)).replace(/\n/g,'<br>');
+    html+='<img src="'+m[1]+'" style="max-width:100%;border-radius:10px;display:block;margin:10px 0">';
+    last=re.lastIndex;
+  }
+  html+=esc(content.slice(last)).replace(/\n/g,'<br>');
+  return html;
+}
+function contentPreview(content){
+  if(!content) return '';
+  let t=legacyToHtml(content);
+  t=t.replace(/<img[^>]*>/gi,'📷 Image ');
+  t=t.replace(/<br\s*\/?>/gi,' ').replace(/<\/?div[^>]*>/gi,' ').replace(/<[^>]+>/g,'');
+  t=t.replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+  return t.replace(/\s+/g,' ').trim();
+}
+function readImageCompressed(file){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=()=>{
+      const img=new Image();
+      img.onload=()=>{
+        const maxW=1000, scale=Math.min(1,maxW/img.width);
+        const canvas=document.createElement('canvas');
+        canvas.width=Math.round(img.width*scale); canvas.height=Math.round(img.height*scale);
+        canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);
+        resolve(canvas.toDataURL('image/jpeg',0.72));
+      };
+      img.onerror=()=>reject(new Error('Not a readable image'));
+      img.src=reader.result;
+    };
+    reader.onerror=()=>reject(new Error('Could not read file'));
+    reader.readAsDataURL(file);
+  });
 }
 
 function h(tag,attrs,children){
@@ -232,8 +270,8 @@ async function render(){
   main.innerHTML='';
   document.querySelectorAll('nav.bottom button').forEach(b=>b.classList.toggle('active',b.dataset.v===view));
   document.getElementById('fab').style.display = view==='daily' ? 'block':'none';
-  document.getElementById('hdrSub').textContent = {daily:'UPSC daily study log',topics:'Organized by subject',
-    revision:'Flagged for revision',search:'Search everything',settings:'Backup & data'}[view];
+  document.getElementById('hdrSub').textContent = ({daily:'UPSC daily study log',topics:'Organized by subject',
+    revision:'Flagged for revision',search:'Search everything',settings:'Backup & data'}[view]) || '';
 
   if(view==='daily') return renderDaily(main);
   if(view==='topics') return renderTopics(main);
@@ -242,6 +280,8 @@ async function render(){
   if(view==='settings') return renderSettings(main);
   if(view==='note') return renderNote(main,curNoteId);
   if(view==='topicDetail') return renderTopicDetail(main,curTopic);
+  if(view==='sectionView') return renderSectionView(main,curSectionId);
+  if(view==='sectionEdit') return renderSectionEdit(main,curSectionId);
 }
 
 async function renderDaily(main){
@@ -288,7 +328,7 @@ async function renderNote(main,noteId){
   ]));
   if(!secs.length) main.appendChild(h('div',{class:'empty'},['No sections yet. Add your first topic section below.']));
   for(const s of secs){
-    main.appendChild(h('div',{class:'card section-card',onclick:()=>openSectionView(s)},[
+    main.appendChild(h('div',{class:'card section-card',onclick:()=>{curSectionId=s.id;view='sectionView';render();}},[
       h('div',{class:'topic'},[s.topic]),
       h('h4',{style:'margin-bottom:0'},[s.title]),
       s.tags&&s.tags.length ? h('div',{style:'margin-top:6px'},s.tags.map(t=>h('span',{class:'tag'},['#'+t]))) : h('span',{})
@@ -297,36 +337,91 @@ async function renderNote(main,noteId){
   main.appendChild(h('button',{class:'btn sec',onclick:()=>openAddSectionModal(noteId)},['+ Add Section']));
 }
 
-function openSectionView(s){
-  openModal(h('div',{},[
-    h('div',{class:'topbar',style:'margin-bottom:8px'},[
-      h('button',{class:'btn ghost',onclick:()=>closeModal()},['← Close']),
-      h('button',{class:'btn ghost',style:'margin-left:auto',onclick:()=>openSectionEditModal(s)},['Edit'])
-    ]),
-    h('div',{class:'topic'},[s.topic]),
-    h('h3',{style:'margin:4px 0 10px'},[s.title]),
-    h('div',{class:'small',style:'margin-bottom:10px'},['Updated '+fmtDate(s.updatedAt)]),
-    h('div',{style:'white-space:pre-wrap;font-size:14px;line-height:1.5'},[s.content||'(no notes yet)']),
-    s.tags&&s.tags.length ? h('div',{style:'margin-top:12px'},s.tags.map(t=>h('span',{class:'tag'},['#'+t]))) : h('span',{})
+async function renderSectionView(main,sectionId){
+  const s=await getOne('sections',sectionId);
+  if(!s){view='note';return render();}
+  const migrated=legacyToHtml(s.content);
+  if(migrated!==s.content){ s.content=migrated; await put('sections',s); }
+  main.appendChild(h('div',{class:'topbar'},[
+    h('button',{class:'back',onclick:()=>{view='note';render();}},['←']),
+    h('div',{style:'flex:1;overflow:hidden'},[h('div',{class:'topic'},[s.topic]),h('div',{class:'date',style:'font-size:16px'},[s.title])])
   ]));
+  main.appendChild(h('div',{class:'pill-row'},[
+    h('button',{onclick:()=>openSectionMetaModal(s)},['Edit Title and Topic']),
+    h('button',{onclick:()=>{curSectionId=s.id;view='sectionEdit';render();}},['Edit Note'])
+  ]));
+  if(s.tags&&s.tags.length) main.appendChild(h('div',{style:'margin-bottom:10px'},s.tags.map(t=>h('span',{class:'tag'},['#'+t]))));
+  main.appendChild(h('div',{class:'small',style:'margin-bottom:8px'},['Updated '+fmtDate(s.updatedAt)]));
+  const body=h('div',{style:'font-size:14px;line-height:1.6;padding-bottom:30px'});
+  body.innerHTML=s.content||'<span style="color:var(--sub)">(no notes yet — tap Edit Note to start writing)</span>';
+  main.appendChild(body);
 }
-async function openSectionEditModal(s){
-  const ta=h('textarea',{id:'ectext'},[]); ta.value=s.content;
+
+let sectionEditFlush=null;
+async function renderSectionEdit(main,sectionId){
+  const s=await getOne('sections',sectionId);
+  if(!s){view='note';return render();}
+  s.content=legacyToHtml(s.content);
+  main.appendChild(h('div',{class:'topbar'},[
+    h('button',{class:'back',onclick:async()=>{ await flushSectionEdit(); view='sectionView'; render(); }},['←']),
+    h('div',{style:'flex:1;overflow:hidden'},[h('div',{class:'topic'},[s.topic]),h('div',{class:'date',style:'font-size:16px'},[s.title])]),
+    h('button',{class:'btn ghost',style:'width:auto;padding:6px 10px;margin:0;white-space:nowrap',onclick:()=>insertImageAtCursor()},['🖼️ Image'])
+  ]));
+  const editor=h('div',{id:'noteEditor',contenteditable:'true',style:'min-height:60vh;font-size:15px;line-height:1.6;outline:none;padding-bottom:40px'});
+  editor.innerHTML=s.content;
+  main.appendChild(editor);
+  const statusLine=h('div',{class:'small',id:'saveStatusLine',style:'text-align:center;padding:6px 0 30px'},['']);
+  main.appendChild(statusLine);
+  let saveTimer=null;
+  const doSave=async()=>{
+    const fresh=await getOne('sections',sectionId);
+    if(!fresh) return;
+    fresh.content=editor.innerHTML; fresh.updatedAt=Date.now();
+    await put('sections',fresh);
+    const line=document.getElementById('saveStatusLine'); if(line) line.textContent='Saved '+fmtTime(Date.now());
+  };
+  editor.oninput=()=>{
+    const line=document.getElementById('saveStatusLine'); if(line) line.textContent='Saving…';
+    if(saveTimer) clearTimeout(saveTimer);
+    saveTimer=setTimeout(doSave,700);
+  };
+  sectionEditFlush=async()=>{ if(saveTimer) clearTimeout(saveTimer); await doSave(); };
+  setTimeout(()=>editor.focus(),50);
+}
+async function flushSectionEdit(){ if(sectionEditFlush){ await sectionEditFlush(); sectionEditFlush=null; } }
+function insertImageAtCursor(){
+  const input=document.createElement('input');
+  input.type='file'; input.accept='image/*';
+  input.onchange=async()=>{
+    const f=input.files[0]; if(!f) return;
+    const editor=document.getElementById('noteEditor'); editor.focus();
+    try{
+      const dataUrl=await readImageCompressed(f);
+      const imgTag='<img src="'+dataUrl+'" style="max-width:100%;border-radius:10px;display:block;margin:10px 0">';
+      if(!document.execCommand('insertHTML',false,imgTag)) editor.innerHTML+=imgTag;
+      editor.dispatchEvent(new Event('input'));
+    }catch(e){ alert('Could not read image: '+e.message); }
+  };
+  input.click();
+}
+async function openSectionMetaModal(s){
   const titleI=h('input',{id:'ectitle'}); titleI.value=s.title;
   const sel=h('select',{id:'ectopic'},TOPICS.map(t=>{const o=h('option',{value:t},[t]); if(t===s.topic)o.selected=true; return o;}));
+  const tagsI=h('input',{id:'ectags',placeholder:'Tags (comma separated)'}); tagsI.value=(s.tags||[]).join(', ');
   openModal(h('div',{},[
-    h('h3',{},['Edit Section']),
+    h('h3',{},['Edit Title and Topic']),
     h('label',{},['Topic']), sel,
     h('label',{},['Title']), titleI,
-    h('label',{},['Notes']), ta,
+    h('label',{},['Tags']), tagsI,
     h('label',{},[h('input',{type:'checkbox',id:'ecrev',style:'width:auto;display:inline;margin-right:6px', checked:s.needsRevision?'checked':undefined}),'Flag for revision']),
     h('button',{class:'btn',onclick:async()=>{
-      s.title=titleI.value.trim()||s.title; s.topic=sel.value; s.content=ta.value;
+      s.title=titleI.value.trim()||s.title; s.topic=sel.value;
+      s.tags=tagsI.value.split(',').map(t=>t.trim()).filter(Boolean);
       s.needsRevision=document.getElementById('ecrev').checked; s.updatedAt=Date.now();
       await put('sections',s); closeModal(); render();
     }},['Save']),
-    h('button',{class:'btn sec',onclick:()=>{openSectionView(s);}},['Cancel']),
-    h('button',{class:'btn danger',onclick:async()=>{ if(confirm('Delete this section?')){ await deleteSection(s.id); closeModal(); render(); } }},['Delete Section'])
+    h('button',{class:'btn sec',onclick:()=>closeModal()},['Cancel']),
+    h('button',{class:'btn danger',onclick:async()=>{ if(confirm('Delete this section?')){ await deleteSection(s.id); closeModal(); view='note'; render(); } }},['Delete Section'])
   ]));
   setTimeout(()=>{const cb=document.getElementById('ecrev'); if(cb) cb.checked=s.needsRevision;},0);
 }
@@ -342,17 +437,15 @@ async function openAddSectionModal(noteId){
   const newBox=h('div',{id:'box_new'},[
     h('label',{},['Section Title']), h('input',{id:'stitle',placeholder:'e.g. Parliamentary Committees'}),
     h('label',{},['UPSC Topic']), h('select',{id:'stopic'},TOPICS.map(t=>h('option',{value:t},[t]))),
-    h('label',{},['Notes']), h('textarea',{id:'scontent',placeholder:'Write notes here...'}),
-    h('label',{},['Tags (comma separated)']), h('input',{id:'stags',placeholder:'e.g. NCERT, static'}),
+    h('label',{},['Tags (comma separated, optional)']), h('input',{id:'stags',placeholder:'e.g. NCERT, static'}),
     h('button',{class:'btn',onclick:async()=>{
       const title=document.getElementById('stitle').value.trim();
       if(!title){alert('Enter a section title');return;}
       const topic=document.getElementById('stopic').value;
-      const content=document.getElementById('scontent').value;
       const tags=document.getElementById('stags').value.split(',').map(t=>t.trim()).filter(Boolean);
-      await addSection(noteId,topic,title,content,tags);
-      closeModal(); render();
-    }},['Save Section'])
+      const s=await addSection(noteId,topic,title,'',tags);
+      closeModal(); curSectionId=s.id; view='sectionEdit'; render();
+    }},['Continue to Notes →'])
   ]);
   const exBox=h('div',{id:'box_existing',style:'display:none'},[
     h('label',{},['Search existing sections']), h('input',{id:'exsearch',placeholder:'e.g. El Niño'}),
@@ -371,19 +464,8 @@ async function openAddSectionModal(noteId){
     if(!q) return;
     const secs=(await all('sections')).filter(s=>s.title.toLowerCase().includes(q)||s.content.toLowerCase().includes(q));
     secs.slice(0,20).forEach(s=>{
-      res.appendChild(h('div',{class:'card',onclick:async()=>{
-        const add=h('textarea',{id:'addcontent',placeholder:"Today's new information..."});
-        openModal(h('div',{},[
-          h('h3',{},['Add to: '+s.title]),
-          h('div',{class:'small'},[s.topic]),
-          add,
-          h('button',{class:'btn',onclick:async()=>{
-            const txt=document.getElementById('addcontent').value.trim();
-            if(!txt){alert('Write something to add');return;}
-            await appendToSection(s.id,txt); closeModal(); render();
-          }},['Add & Save'])
-        ]));
-      }},[h('div',{class:'topic'},[s.topic]),h('h4',{},[s.title]),h('div',{class:'meta'},['Last updated '+fmtDate(s.updatedAt)])]));
+      res.appendChild(h('div',{class:'card',onclick:()=>{ closeModal(); curSectionId=s.id; view='sectionView'; render(); }},
+        [h('div',{class:'topic'},[s.topic]),h('h4',{},[s.title]),h('div',{class:'meta'},['Last updated '+fmtDate(s.updatedAt)])]));
     });
   };
 }
@@ -410,10 +492,10 @@ async function renderTopicDetail(main,topic){
   if(!secs.length) main.appendChild(h('div',{class:'empty'},['No sections under this topic yet.']));
   for(const s of secs){
     const dn=notesById[s.dailyNoteId];
-    main.appendChild(h('div',{class:'card section-card',onclick:()=>{curNoteId=s.dailyNoteId;view='note';render();}},[
+    main.appendChild(h('div',{class:'card section-card',onclick:()=>{curSectionId=s.id;view='sectionView';render();}},[
       h('h4',{},[s.title]),
       h('div',{class:'meta'},['From: '+(dn?fmtDate(dn.date):'')]),
-      h('div',{class:'content'},[s.content])
+      h('div',{class:'content'},[contentPreview(s.content)])
     ]));
   }
 }
@@ -422,7 +504,7 @@ async function renderRevision(main){
   const secs=(await all('sections')).filter(s=>s.needsRevision);
   if(!secs.length){ main.appendChild(h('div',{class:'empty'},['Nothing flagged. Open a section and check "Flag for revision" to add it here.'])); return; }
   for(const s of secs){
-    main.appendChild(h('div',{class:'card section-card',onclick:()=>{curNoteId=s.dailyNoteId;view='note';render();}},[
+    main.appendChild(h('div',{class:'card section-card',onclick:()=>{curSectionId=s.id;view='sectionView';render();}},[
       h('div',{class:'topic'},[s.topic]), h('h4',{},[s.title]),
       h('div',{class:'meta'},['Updated '+fmtDate(s.updatedAt)])
     ]));
@@ -443,10 +525,10 @@ async function renderSearch(main){
     if(!matches.length){ results.appendChild(h('div',{class:'empty'},['No matches.'])); return; }
     matches.forEach(s=>{
       const dn=notesById[s.dailyNoteId];
-      results.appendChild(h('div',{class:'card section-card',onclick:()=>{curNoteId=s.dailyNoteId;view='note';render();}},[
+      results.appendChild(h('div',{class:'card section-card',onclick:()=>{curSectionId=s.id;view='sectionView';render();}},[
         h('div',{class:'topic'},[s.topic]), h('h4',{},[s.title]),
         h('div',{class:'meta'},['From: '+(dn?fmtDate(dn.date):'')]),
-        h('div',{class:'content'},[s.content])
+        h('div',{class:'content'},[contentPreview(s.content)])
       ]));
     });
   };
@@ -521,7 +603,10 @@ async function importBackup(){
   }catch(e){ alert('Invalid backup file'); }
 }
 
-document.querySelectorAll('nav.bottom button').forEach(b=>b.onclick=()=>{view=b.dataset.v; render();});
+document.querySelectorAll('nav.bottom button').forEach(b=>b.onclick=async()=>{
+  if(view==='sectionEdit') await flushSectionEdit();
+  view=b.dataset.v; render();
+});
 
 (async()=>{ try{ db=await openDB(); render(); if(navigator.onLine){ setSyncStatus('syncing'); autoSync(); } else { setSyncStatus('offline'); } }catch(e){ document.getElementById('main').textContent='Storage error: '+e; } })();
 </script>  <script>
